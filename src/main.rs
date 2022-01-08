@@ -1,15 +1,16 @@
 extern crate tun_tap;
 
+
+use std::time::Instant;
 use clap::Parser;
 use std::io::Error;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::Arc;
-use std::thread;
 use tun_tap::{Iface, Mode};
-
-//     https://github.com/rust-vsock/vsock-rs/blob/master/echo_server/src/main.rs
+use crossbeam_utils::thread;
+use ringbuf::RingBuffer;
 
 #[derive(Parser)]
 #[clap(version = "1.0", author = "Pennefather S. <pennefather.sean@gmail.com>")]
@@ -25,21 +26,82 @@ fn cmd(cmd: &str, args: &[&str]) {
 
 // [TUN a] <--> [Socket] <--> [TUN b]
 fn tun_to_sock(tun: std::sync::Arc<tun_tap::Iface>, sock: &mut std::net::TcpStream) {
-    let mut buf = [0; 4096];
     println!("Creating TUN consumer");
-    loop {
-        let amount = tun.recv(&mut buf).unwrap();
-        sock.write(&buf[0..amount]).unwrap();
-    }
+
+
+
+    // let mut buf = [0; 4096];
+    // loop {
+    //     let amount = tun.recv(&mut buf).unwrap();
+    //     sock.write(&buf[0..amount]).unwrap();
+    // }
+
+    let rb = RingBuffer::new(1000);
+    let (mut prod, mut cons) = rb.split();
+    let mut buf = [0; 4096];
+    thread::scope(|s| { 
+        let reader =  s.spawn(|_| {
+            loop {
+                let amount = tun.recv(&mut buf).unwrap();
+                prod.push(buf[0..amount].to_vec()).unwrap();      
+            }
+        });
+
+        let writer = s.spawn(|_| {
+            loop {
+                match cons.pop() {
+                    Some(buf) => {
+                        let current = Instant::now();
+                        sock.write(&buf).unwrap();
+                        let duration = current.elapsed();
+                        println!("buffer width: {}, time taken to read: {:?}", cons.len(), duration) ;
+                    },
+                    None => ()
+                };
+            }
+        });
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }).unwrap();
 }
 
 fn sock_to_tun(tun: std::sync::Arc<tun_tap::Iface>, sock: &mut std::net::TcpStream) {
-    let mut buf = [0; 4096];
     println!("Creating SOCK consumer");
-    loop {
-        let amount = sock.read(&mut buf).unwrap();
-        tun.send(&buf[0..amount]).unwrap();
-    }
+
+    // let mut buf = [0; 4096];
+    // loop {
+    //     let amount = sock.read(&mut buf).unwrap();
+    //     tun.send(&buf[0..amount]).unwrap();
+    // }
+
+    let rb = RingBuffer::new(1000);
+    let (mut prod, mut cons) = rb.split();
+    let mut buf = [0; 4096];
+    thread::scope(|s| { 
+        let reader =  s.spawn(|_| {
+            loop {
+                
+                let amount = sock.read(&mut buf).unwrap();              
+                prod.push(buf[0..amount].to_vec()).unwrap();     
+            }
+        });
+
+        let writer = s.spawn(|_| {
+            loop {
+                match cons.pop() {
+                    Some(buf) => {
+                        tun.send(&buf).unwrap();
+                    },
+                    None => ()
+                };
+            }
+        });
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }).unwrap();
+
 }
 
 fn create_server_socket() -> Result<TcpStream, Error> {
@@ -64,15 +126,12 @@ fn client_application() {
     let mut sock_reader = create_client_socket();
     let mut sock_writer = sock_reader.try_clone().expect("Failed to clone socket");
 
-    let sock_tun_handle = thread::spawn(move || {
-        sock_to_tun(tun_writer, &mut sock_reader);
-    });
-    let tun_sock_handle = thread::spawn(move || {
-        tun_to_sock(tun_reader, &mut sock_writer);
-    });
-
-    tun_sock_handle.join().unwrap();
-    sock_tun_handle.join().unwrap();
+    thread::scope(|s| {
+        let sock_tun_handle = s.spawn(move |_| { sock_to_tun(tun_writer, &mut sock_reader);});
+        let tun_sock_handle = s.spawn(move |_| {  tun_to_sock(tun_reader, &mut sock_writer);});
+        tun_sock_handle.join().unwrap();
+        sock_tun_handle.join().unwrap();
+    }).unwrap();
 }
 
 fn server_application() {
@@ -85,15 +144,12 @@ fn server_application() {
     let mut sock_reader = create_server_socket().unwrap();
     let mut sock_writer = sock_reader.try_clone().expect("Failed to clone socket");
 
-    let sock_tun_handle = thread::spawn(move || {
-        sock_to_tun(tun_writer, &mut sock_reader);
-    });
-    let tun_sock_handle = thread::spawn(move || {
-        tun_to_sock(tun_reader, &mut sock_writer);
-    });
-
-    tun_sock_handle.join().unwrap();
-    sock_tun_handle.join().unwrap();
+    thread::scope(|s| {
+        let sock_tun_handle = s.spawn(move |_| { sock_to_tun(tun_writer, &mut sock_reader);});
+        let tun_sock_handle = s.spawn(move |_| {  tun_to_sock(tun_reader, &mut sock_writer);});
+        tun_sock_handle.join().unwrap();
+        sock_tun_handle.join().unwrap();
+    }).unwrap();
 }
 
 fn main() {

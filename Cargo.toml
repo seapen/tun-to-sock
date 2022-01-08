@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 tun-tap = "0.1.2"
 clap = "3.0.0-beta.5"
+crossbeam-utils = "0.8.5"
+ringbuf = "0.2.6"
